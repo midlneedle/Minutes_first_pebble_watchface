@@ -17,7 +17,8 @@
 #define INTRO_ROTATE_STEP_COUNT 3
 #define INTRO_ROTATE_MOVE_MS 380
 #define INTRO_ROTATE_HOLD_MS 220
-#define INTRO_MINUTES_DELAY_MS 280
+#define INTRO_BRIGHTEN_LIGHT_MS 140
+#define INTRO_BRIGHTEN_WHITE_MS 120
 #define Q16_ONE 65536
 
 static Window *s_main_window;
@@ -29,7 +30,8 @@ static AppTimer *s_intro_timer;
 typedef enum {
   INTRO_PHASE_START_DELAY = 0,
   INTRO_PHASE_HOURS_ROTATE,
-  INTRO_PHASE_MINUTES_DELAY,
+  INTRO_PHASE_BRIGHTEN_LIGHT,
+  INTRO_PHASE_BRIGHTEN_WHITE,
   INTRO_PHASE_DONE
 } IntroPhase;
 
@@ -574,6 +576,14 @@ static GPoint get_ring_position_q16(const GPoint centers[HOURS_RING_COUNT], int3
   return lerp_point_q16(centers[idx0], centers[idx1], frac_q16);
 }
 
+static int32_t floor_q16_to_int(int32_t value_q16) {
+  int32_t value = value_q16 / Q16_ONE;
+  if(value_q16 < 0 && (value_q16 % Q16_ONE) != 0) {
+    value -= 1;
+  }
+  return value;
+}
+
 static void stop_intro_animation(void) {
   if(s_intro_timer) {
     app_timer_cancel(s_intro_timer);
@@ -601,7 +611,7 @@ static void intro_timer_callback(void *context) {
 
     if(s_intro_phase_elapsed_ms >= total_rotate_ms) {
       s_intro_rotation_offset_q16 = 0;
-      s_intro_phase = INTRO_PHASE_MINUTES_DELAY;
+      s_intro_phase = INTRO_PHASE_BRIGHTEN_LIGHT;
       s_intro_phase_elapsed_ms = 0;
     } else {
       int segment_index = s_intro_phase_elapsed_ms / segment_total_ms;
@@ -616,10 +626,17 @@ static void intro_timer_callback(void *context) {
         s_intro_rotation_offset_q16 = (start_slot + 1) * Q16_ONE;
       }
     }
-  } else if(s_intro_phase == INTRO_PHASE_MINUTES_DELAY) {
+  } else if(s_intro_phase == INTRO_PHASE_BRIGHTEN_LIGHT) {
     s_intro_phase_elapsed_ms += INTRO_TIMER_MS;
-    if(s_intro_phase_elapsed_ms >= INTRO_MINUTES_DELAY_MS) {
+    if(s_intro_phase_elapsed_ms >= INTRO_BRIGHTEN_LIGHT_MS) {
+      s_intro_phase = INTRO_PHASE_BRIGHTEN_WHITE;
+      s_intro_phase_elapsed_ms = 0;
+    }
+  } else if(s_intro_phase == INTRO_PHASE_BRIGHTEN_WHITE) {
+    s_intro_phase_elapsed_ms += INTRO_TIMER_MS;
+    if(s_intro_phase_elapsed_ms >= INTRO_BRIGHTEN_WHITE_MS) {
       s_intro_phase = INTRO_PHASE_DONE;
+      s_intro_phase_elapsed_ms = 0;
     }
   }
 
@@ -729,19 +746,15 @@ static void draw_small_number(GContext *ctx, int value, GPoint center, GColor co
   }
 }
 
-static void draw_minutes(GContext *ctx, GRect bounds) {
-  char buffer[3];
-  snprintf(buffer, sizeof(buffer), "%02d", s_minute);
-
+static void draw_minutes(GContext *ctx, GRect bounds, int left_digit, int right_digit, GColor color) {
   int total_width = 2 * LARGE_WIDTH + LARGE_DIGIT_GAP;
   int start_x = (bounds.size.w - total_width) / 2;
   int start_y = (bounds.size.h - LARGE_HEIGHT) / 2;
 
-  for(int i = 0; i < 2; ++i) {
-    int digit = buffer[i] - '0';
-    GPoint origin = GPoint(start_x + i * (LARGE_WIDTH + LARGE_DIGIT_GAP), start_y);
-    draw_digit_bitmap(ctx, LARGE_DIGITS[digit], LARGE_WIDTH, LARGE_HEIGHT, origin, GColorWhite);
-  }
+  GPoint left_origin = GPoint(start_x, start_y);
+  GPoint right_origin = GPoint(start_x + LARGE_WIDTH + LARGE_DIGIT_GAP, start_y);
+  draw_digit_bitmap(ctx, LARGE_DIGITS[left_digit], LARGE_WIDTH, LARGE_HEIGHT, left_origin, color);
+  draw_digit_bitmap(ctx, LARGE_DIGITS[right_digit], LARGE_WIDTH, LARGE_HEIGHT, right_origin, color);
 }
 
 static void draw_hours_ring(GContext *ctx, GRect bounds) {
@@ -750,10 +763,14 @@ static void draw_hours_ring(GContext *ctx, GRect bounds) {
 
   const GColor active = GColorWhite;
   const GColor inactive = PBL_IF_COLOR_ELSE(GColorFromRGB(0x55, 0x55, 0x55), GColorLightGray);
+  const GColor light_active = PBL_IF_COLOR_ELSE(GColorFromRGB(0xAA, 0xAA, 0xAA), GColorLightGray);
   int active_hour = s_hour;
+  GColor active_color = active;
 
   if(s_intro_phase == INTRO_PHASE_START_DELAY || s_intro_phase == INTRO_PHASE_HOURS_ROTATE) {
     active_hour = -1;
+  } else if(s_intro_phase == INTRO_PHASE_BRIGHTEN_LIGHT) {
+    active_color = light_active;
   }
 
   for(int i = 0; i < HOURS_RING_COUNT; ++i) {
@@ -764,7 +781,7 @@ static void draw_hours_ring(GContext *ctx, GRect bounds) {
     }
 
     int number = HOUR_NUMBERS[i];
-    GColor color = (number == active_hour) ? active : inactive;
+    GColor color = (number == active_hour) ? active_color : inactive;
     draw_small_number(ctx, number, center, color);
   }
 }
@@ -777,9 +794,21 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
 
   draw_hours_ring(ctx, bounds);
 
-  if(s_intro_phase == INTRO_PHASE_DONE) {
-    draw_minutes(ctx, bounds);
+  const GColor inactive = PBL_IF_COLOR_ELSE(GColorFromRGB(0x55, 0x55, 0x55), GColorLightGray);
+  const GColor light_active = PBL_IF_COLOR_ELSE(GColorFromRGB(0xAA, 0xAA, 0xAA), GColorLightGray);
+  int left_digit = s_minute / 10;
+  int right_digit = s_minute % 10;
+  GColor minutes_color = GColorWhite;
+
+  if(s_intro_phase == INTRO_PHASE_START_DELAY || s_intro_phase == INTRO_PHASE_HOURS_ROTATE) {
+    int shift = (int)floor_q16_to_int(s_intro_rotation_offset_q16);
+    right_digit = positive_mod(right_digit + shift, 10);
+    minutes_color = inactive;
+  } else if(s_intro_phase == INTRO_PHASE_BRIGHTEN_LIGHT) {
+    minutes_color = light_active;
   }
+
+  draw_minutes(ctx, bounds, left_digit, right_digit, minutes_color);
 }
 
 static void update_time(void) {
