@@ -10,10 +10,34 @@
 #define LARGE_HEIGHT 28
 #define LARGE_DIGIT_GAP 4
 
+#define HOURS_RING_COUNT 12
+#define INTRO_TIMER_MS 25
+#define INTRO_START_DELAY_MS 140
+#define INTRO_ROTATE_START_OFFSET (-3)
+#define INTRO_ROTATE_STEP_COUNT 3
+#define INTRO_ROTATE_MOVE_MS 380
+#define INTRO_ROTATE_HOLD_MS 220
+#define INTRO_MINUTES_DELAY_MS 280
+#define Q16_ONE 65536
+
 static Window *s_main_window;
 static Layer *s_canvas_layer;
 static int s_hour = 12;
 static int s_minute = 0;
+static AppTimer *s_intro_timer;
+
+typedef enum {
+  INTRO_PHASE_START_DELAY = 0,
+  INTRO_PHASE_HOURS_ROTATE,
+  INTRO_PHASE_MINUTES_DELAY,
+  INTRO_PHASE_DONE
+} IntroPhase;
+
+static IntroPhase s_intro_phase = INTRO_PHASE_DONE;
+static uint32_t s_intro_phase_elapsed_ms = 0;
+static int32_t s_intro_rotation_offset_q16 = 0;
+
+static const int HOUR_NUMBERS[HOURS_RING_COUNT] = {11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
 
 static const char *SMALL_DIGITS[10][SMALL_HEIGHT] = {
   {
@@ -481,6 +505,147 @@ static const char *LARGE_DIGITS[10][LARGE_HEIGHT] = {
   }
 };
 
+static int positive_mod(int value, int divisor) {
+  int result = value % divisor;
+  return (result < 0) ? result + divisor : result;
+}
+
+static int32_t ease_in_out_cubic_q16(int32_t t_q16) {
+  if(t_q16 <= 0) {
+    return 0;
+  }
+  if(t_q16 >= Q16_ONE) {
+    return Q16_ONE;
+  }
+
+  if(t_q16 < (Q16_ONE / 2)) {
+    int64_t t = t_q16;
+    int64_t denom = (int64_t)Q16_ONE * Q16_ONE;
+    return (int32_t)((4LL * t * t * t) / denom);
+  }
+
+  int64_t inv_t = Q16_ONE - t_q16;
+  int64_t denom = (int64_t)Q16_ONE * Q16_ONE;
+  return (int32_t)(Q16_ONE - ((4LL * inv_t * inv_t * inv_t) / denom));
+}
+
+static GPoint lerp_point_q16(GPoint from, GPoint to, int32_t t_q16) {
+  int32_t x = from.x + (int32_t)(((int64_t)(to.x - from.x) * t_q16) / Q16_ONE);
+  int32_t y = from.y + (int32_t)(((int64_t)(to.y - from.y) * t_q16) / Q16_ONE);
+  return GPoint((int16_t)x, (int16_t)y);
+}
+
+static void get_hours_ring_centers(GRect bounds, GPoint centers[HOURS_RING_COUNT]) {
+  const int cx = bounds.size.w / 2;
+  const int cy = bounds.size.h / 2;
+
+  const int top_y = SMALL_MARGIN + SMALL_HEIGHT / 2;
+  const int bottom_y = bounds.size.h - SMALL_MARGIN - SMALL_HEIGHT / 2;
+  const int left_x = SMALL_MARGIN + SMALL_WIDTH / 2;
+  const int right_x = bounds.size.w - SMALL_MARGIN - SMALL_WIDTH / 2;
+
+  const int horizontal_offset = SMALL_WIDTH + SMALL_SPACING;
+  const int vertical_offset = SMALL_HEIGHT + SMALL_SPACING;
+
+  centers[0] = GPoint(cx - horizontal_offset, top_y);      // 11
+  centers[1] = GPoint(cx, top_y);                          // 12
+  centers[2] = GPoint(cx + horizontal_offset, top_y);      // 1
+  centers[3] = GPoint(right_x, cy - vertical_offset);      // 2
+  centers[4] = GPoint(right_x, cy);                        // 3
+  centers[5] = GPoint(right_x, cy + vertical_offset);      // 4
+  centers[6] = GPoint(cx + horizontal_offset, bottom_y);   // 5
+  centers[7] = GPoint(cx, bottom_y);                       // 6
+  centers[8] = GPoint(cx - horizontal_offset, bottom_y);   // 7
+  centers[9] = GPoint(left_x, cy + vertical_offset);       // 8
+  centers[10] = GPoint(left_x, cy);                        // 9
+  centers[11] = GPoint(left_x, cy - vertical_offset);      // 10
+}
+
+static GPoint get_ring_position_q16(const GPoint centers[HOURS_RING_COUNT], int32_t ring_index_q16) {
+  int32_t base_index = ring_index_q16 / Q16_ONE;
+  int32_t frac_q16 = ring_index_q16 % Q16_ONE;
+  if(frac_q16 < 0) {
+    frac_q16 += Q16_ONE;
+    base_index -= 1;
+  }
+
+  int idx0 = positive_mod(base_index, HOURS_RING_COUNT);
+  int idx1 = (idx0 + 1) % HOURS_RING_COUNT;
+  return lerp_point_q16(centers[idx0], centers[idx1], frac_q16);
+}
+
+static void stop_intro_animation(void) {
+  if(s_intro_timer) {
+    app_timer_cancel(s_intro_timer);
+    s_intro_timer = NULL;
+  }
+}
+
+static void intro_timer_callback(void *context) {
+  (void)context;
+  s_intro_timer = NULL;
+
+  if(s_intro_phase == INTRO_PHASE_START_DELAY) {
+    s_intro_phase_elapsed_ms += INTRO_TIMER_MS;
+    if(s_intro_phase_elapsed_ms >= INTRO_START_DELAY_MS) {
+      s_intro_phase = INTRO_PHASE_HOURS_ROTATE;
+      s_intro_phase_elapsed_ms = 0;
+      s_intro_rotation_offset_q16 = INTRO_ROTATE_START_OFFSET * Q16_ONE;
+    }
+  } else if(s_intro_phase == INTRO_PHASE_HOURS_ROTATE) {
+    const uint32_t segment_total_ms = INTRO_ROTATE_MOVE_MS + INTRO_ROTATE_HOLD_MS;
+    const int total_segments = INTRO_ROTATE_STEP_COUNT;
+    const uint32_t total_rotate_ms = (uint32_t)total_segments * segment_total_ms;
+
+    s_intro_phase_elapsed_ms += INTRO_TIMER_MS;
+
+    if(s_intro_phase_elapsed_ms >= total_rotate_ms) {
+      s_intro_rotation_offset_q16 = 0;
+      s_intro_phase = INTRO_PHASE_MINUTES_DELAY;
+      s_intro_phase_elapsed_ms = 0;
+    } else {
+      int segment_index = s_intro_phase_elapsed_ms / segment_total_ms;
+      uint32_t segment_elapsed_ms = s_intro_phase_elapsed_ms % segment_total_ms;
+      int start_slot = INTRO_ROTATE_START_OFFSET + segment_index;
+
+      if(segment_elapsed_ms < INTRO_ROTATE_MOVE_MS) {
+        int32_t t_q16 = (int32_t)(((int64_t)segment_elapsed_ms * Q16_ONE) / INTRO_ROTATE_MOVE_MS);
+        int32_t eased_q16 = ease_in_out_cubic_q16(t_q16);
+        s_intro_rotation_offset_q16 = start_slot * Q16_ONE + eased_q16;
+      } else {
+        s_intro_rotation_offset_q16 = (start_slot + 1) * Q16_ONE;
+      }
+    }
+  } else if(s_intro_phase == INTRO_PHASE_MINUTES_DELAY) {
+    s_intro_phase_elapsed_ms += INTRO_TIMER_MS;
+    if(s_intro_phase_elapsed_ms >= INTRO_MINUTES_DELAY_MS) {
+      s_intro_phase = INTRO_PHASE_DONE;
+    }
+  }
+
+  if(s_canvas_layer) {
+    layer_mark_dirty(s_canvas_layer);
+  }
+
+  if(s_intro_phase != INTRO_PHASE_DONE) {
+    s_intro_timer = app_timer_register(INTRO_TIMER_MS, intro_timer_callback, NULL);
+  }
+}
+
+static void start_intro_animation(void) {
+  stop_intro_animation();
+
+  s_intro_phase = INTRO_PHASE_START_DELAY;
+  s_intro_phase_elapsed_ms = 0;
+  s_intro_rotation_offset_q16 = INTRO_ROTATE_START_OFFSET * Q16_ONE;
+
+  if(s_canvas_layer) {
+    layer_mark_dirty(s_canvas_layer);
+  }
+
+  s_intro_timer = app_timer_register(INTRO_TIMER_MS, intro_timer_callback, NULL);
+}
+
 static void draw_digit_bitmap(GContext *ctx, const char *rows[], int width, int height, GPoint origin, GColor color) {
   graphics_context_set_fill_color(ctx, color);
   for(int y = 0; y < height; ++y) {
@@ -580,40 +745,27 @@ static void draw_minutes(GContext *ctx, GRect bounds) {
 }
 
 static void draw_hours_ring(GContext *ctx, GRect bounds) {
-  const int cx = bounds.size.w / 2;
-  const int cy = bounds.size.h / 2;
-
-  const int top_y = SMALL_MARGIN + SMALL_HEIGHT / 2;
-  const int bottom_y = bounds.size.h - SMALL_MARGIN - SMALL_HEIGHT / 2;
-  const int left_x = SMALL_MARGIN + SMALL_WIDTH / 2;
-  const int right_x = bounds.size.w - SMALL_MARGIN - SMALL_WIDTH / 2;
-
-  const int horizontal_offset = SMALL_WIDTH + SMALL_SPACING;
-  const int vertical_offset = SMALL_HEIGHT + SMALL_SPACING;
-
-  GPoint centers[] = {
-    {cx - horizontal_offset, top_y}, // 11
-    {cx, top_y},                     // 12
-    {cx + horizontal_offset, top_y}, // 1
-    {right_x, cy - vertical_offset}, // 2
-    {right_x, cy},                   // 3
-    {right_x, cy + vertical_offset}, // 4
-    {cx + horizontal_offset, bottom_y}, // 5
-    {cx, bottom_y},                     // 6
-    {cx - horizontal_offset, bottom_y}, // 7
-    {left_x, cy + vertical_offset},     // 8
-    {left_x, cy},                       // 9
-    {left_x, cy - vertical_offset}      // 10
-  };
-
-  const int numbers[] = {11, 12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  GPoint centers[HOURS_RING_COUNT];
+  get_hours_ring_centers(bounds, centers);
 
   const GColor active = GColorWhite;
   const GColor inactive = PBL_IF_COLOR_ELSE(GColorFromRGB(0x55, 0x55, 0x55), GColorLightGray);
+  int active_hour = s_hour;
 
-  for(size_t i = 0; i < ARRAY_LENGTH(numbers); ++i) {
-    GColor color = (numbers[i] == s_hour) ? active : inactive;
-    draw_small_number(ctx, numbers[i], centers[i], color);
+  if(s_intro_phase == INTRO_PHASE_START_DELAY || s_intro_phase == INTRO_PHASE_HOURS_ROTATE) {
+    active_hour = -1;
+  }
+
+  for(int i = 0; i < HOURS_RING_COUNT; ++i) {
+    GPoint center = centers[i];
+    if(s_intro_phase == INTRO_PHASE_START_DELAY || s_intro_phase == INTRO_PHASE_HOURS_ROTATE) {
+      int32_t ring_index_q16 = i * Q16_ONE + s_intro_rotation_offset_q16;
+      center = get_ring_position_q16(centers, ring_index_q16);
+    }
+
+    int number = HOUR_NUMBERS[i];
+    GColor color = (number == active_hour) ? active : inactive;
+    draw_small_number(ctx, number, center, color);
   }
 }
 
@@ -624,7 +776,10 @@ static void canvas_update_proc(Layer *layer, GContext *ctx) {
   graphics_fill_rect(ctx, bounds, 0, GCornerNone);
 
   draw_hours_ring(ctx, bounds);
-  draw_minutes(ctx, bounds);
+
+  if(s_intro_phase == INTRO_PHASE_DONE) {
+    draw_minutes(ctx, bounds);
+  }
 }
 
 static void update_time(void) {
@@ -659,10 +814,14 @@ static void main_window_load(Window *window) {
   s_canvas_layer = layer_create(bounds);
   layer_set_update_proc(s_canvas_layer, canvas_update_proc);
   layer_add_child(window_layer, s_canvas_layer);
+
+  start_intro_animation();
 }
 
 static void main_window_unload(Window *window) {
+  stop_intro_animation();
   layer_destroy(s_canvas_layer);
+  s_canvas_layer = NULL;
 }
 
 static void init(void) {
@@ -673,13 +832,14 @@ static void init(void) {
     .unload = main_window_unload
   });
 
-  window_stack_push(s_main_window, true);
-
   tick_timer_service_subscribe(MINUTE_UNIT, tick_handler);
   update_time();
+
+  window_stack_push(s_main_window, true);
 }
 
 static void deinit(void) {
+  stop_intro_animation();
   tick_timer_service_unsubscribe();
   window_destroy(s_main_window);
 }
