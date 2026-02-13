@@ -327,7 +327,7 @@ static const char *LARGE_DIGITS[10][LARGE_HEIGHT] = {
     "00000000000000111100",
     "00000000000000111100",
     "00000000000000111100",
-    "00000000000000111100"
+    "00000000000000111100 "
   },
   {
     "11111111111111111111",
@@ -396,28 +396,28 @@ static const char *LARGE_DIGITS[10][LARGE_HEIGHT] = {
     "11111111111111111111",
     "00000000000000001111",
     "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111",
-    "00000000000000001111"
+    "00000000000000111111",
+    "00000000000000111111",
+    "00000000000000111100",
+    "00000000000000111100",
+    "00000000000011111100",
+    "00000000000011111100",
+    "00000000000011110000",
+    "00000000000011110000",
+    "00000000001111110000",
+    "00000000001111110000",
+    "00000000001111000000",
+    "00000000001111000000",
+    "00000000111111000000",
+    "00000000111111000000",
+    "00000000111100000000",
+    "00000000111100000000",
+    "00000011111100000000",
+    "00000011111100000000",
+    "00000011110000000000",
+    "00000011110000000000",
+    "00001111110000000000",
+    "00001111110000000000"
   },
   {
     "00001111111111110000",
@@ -426,6 +426,8 @@ static const char *LARGE_DIGITS[10][LARGE_HEIGHT] = {
     "00111111111111111100",
     "11111100000000111111",
     "11111100000000111111",
+    "11110000000000001111",
+    "11110000000000001111",
     "11110000000000001111",
     "11110000000000001111",
     "00111100000000111100",
@@ -491,12 +493,68 @@ static void draw_digit_bitmap(GContext *ctx, const char *rows[], int width, int 
   }
 }
 
+static void get_small_digit_ink_bounds(int digit, int *out_min_x, int *out_max_x) {
+  int min_x = SMALL_WIDTH - 1;
+  int max_x = 0;
+  bool found = false;
+
+  for(int y = 0; y < SMALL_HEIGHT; ++y) {
+    const char *row = SMALL_DIGITS[digit][y];
+    for(int x = 0; x < SMALL_WIDTH; ++x) {
+      if(row[x] == '1') {
+        if(x < min_x) {
+          min_x = x;
+        }
+        if(x > max_x) {
+          max_x = x;
+        }
+        found = true;
+      }
+    }
+  }
+
+  if(!found) {
+    min_x = 0;
+    max_x = SMALL_WIDTH - 1;
+  }
+
+  *out_min_x = min_x;
+  *out_max_x = max_x;
+}
+
+static void get_small_number_ink_bounds(const char *buffer, int len, int *out_min_x, int *out_max_x) {
+  int min_x = SMALL_WIDTH * len;
+  int max_x = 0;
+
+  for(int i = 0; i < len; ++i) {
+    int digit = buffer[i] - '0';
+    int digit_min_x = 0;
+    int digit_max_x = 0;
+    int offset_x = i * (SMALL_WIDTH + SMALL_DIGIT_GAP);
+
+    get_small_digit_ink_bounds(digit, &digit_min_x, &digit_max_x);
+
+    if(offset_x + digit_min_x < min_x) {
+      min_x = offset_x + digit_min_x;
+    }
+    if(offset_x + digit_max_x > max_x) {
+      max_x = offset_x + digit_max_x;
+    }
+  }
+
+  *out_min_x = min_x;
+  *out_max_x = max_x;
+}
+
 static void draw_small_number(GContext *ctx, int value, GPoint center, GColor color) {
   char buffer[3];
   snprintf(buffer, sizeof(buffer), "%d", value);
   int len = strlen(buffer);
-  int total_width = len * SMALL_WIDTH + (len - 1) * SMALL_DIGIT_GAP;
-  int start_x = center.x - total_width / 2;
+  int ink_min_x = 0;
+  int ink_max_x = 0;
+  get_small_number_ink_bounds(buffer, len, &ink_min_x, &ink_max_x);
+  int ink_width = ink_max_x - ink_min_x + 1;
+  int start_x = center.x - ink_width / 2 - ink_min_x;
   int start_y = center.y - SMALL_HEIGHT / 2;
 
   for(int i = 0; i < len; ++i) {
