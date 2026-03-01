@@ -1,5 +1,5 @@
 because who needs hours when you have minutes
 
-minimalist Pebble watchface that priorities what actually matters
+watchface that priorities what actually matters
 
 made for Pebble watches that still work somehow
